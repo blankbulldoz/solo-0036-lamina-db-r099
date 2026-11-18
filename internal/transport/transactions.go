@@ -24,11 +24,12 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 		Relation   string    `json:"relation"`
 		Row        datum.Row `json:"row"`
 		InsertOnly bool      `json:"insert_only"`
+		Temporary  bool      `json:"temporary"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if err := s.db.Put(r.PathValue("tx"), in.Relation, in.Row, in.InsertOnly); err != nil {
+	if err := s.db.Put(r.PathValue("tx"), in.Relation, in.Row, in.InsertOnly, in.Temporary); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -36,13 +37,14 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) deleteRow(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Relation string      `json:"relation"`
-		Key      datum.Value `json:"key"`
+		Relation  string      `json:"relation"`
+		Key       datum.Value `json:"key"`
+		Temporary bool        `json:"temporary"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if err := s.db.Delete(r.PathValue("tx"), in.Relation, in.Key); err != nil {
+	if err := s.db.Delete(r.PathValue("tx"), in.Relation, in.Key, in.Temporary); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -68,11 +70,12 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		Relation    string      `json:"relation"`
 		Key         datum.Value `json:"key"`
 		Transaction string      `json:"transaction"`
+		Temporary   bool        `json:"temporary"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	out, err := s.db.Get(in.Transaction, in.Relation, in.Key)
+	out, err := s.db.Get(in.Transaction, in.Relation, in.Key, in.Temporary)
 	if err != nil {
 		respondError(w, err)
 		return

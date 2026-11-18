@@ -15,15 +15,18 @@ type staged struct {
 	InsertOnly bool
 }
 type Transaction struct {
-	ID       string `json:"id"`
-	Snapshot uint64 `json:"snapshot"`
-	ReadOnly bool   `json:"read_only"`
-	Started  string `json:"started"`
-	writes   map[string]map[string]staged
+	ID                 string `json:"id"`
+	Snapshot           uint64 `json:"snapshot"`
+	ReadOnly           bool   `json:"read_only"`
+	Started            string `json:"started"`
+	TemporaryRelations int    `json:"temporary_relations,omitempty"`
+	writes             map[string]map[string]staged
+	temporary          map[string]*temporaryRelation
 }
 type Commit struct {
-	Sequence uint64 `json:"sequence"`
-	Writes   int    `json:"writes"`
+	Sequence          uint64 `json:"sequence"`
+	Writes            int    `json:"writes"`
+	TemporaryReleased int    `json:"temporary_released"`
 }
 
 func (d *DB) Begin(readOnly bool) (Transaction, error) {
@@ -39,10 +42,12 @@ func (d *DB) Begin(readOnly bool) (Transaction, error) {
 	if _, err := rand.Read(id[:]); err != nil {
 		return Transaction{}, err
 	}
-	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}}
+	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}, temporary: map[string]*temporaryRelation{}}
 	d.transactions[tx.ID] = tx
 	out := *tx
 	out.writes = nil
+	out.temporary = nil
+	out.TemporaryRelations = 0
 	return out, nil
 }
 func (d *DB) tx(id string) (*Transaction, error) {
@@ -52,7 +57,7 @@ func (d *DB) tx(id string) (*Transaction, error) {
 	}
 	return tx, nil
 }
-func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
+func (d *DB) Put(id, table string, row datum.Row, insertOnly, temporary bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
@@ -64,6 +69,9 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 	}
 	if tx.ReadOnly {
 		return fault("conflict", "read-only transaction")
+	}
+	if temporary {
+		return d.putTemporary(tx, table, row, insertOnly)
 	}
 	r, err := d.catalog.Relation(table)
 	if err != nil {
@@ -106,7 +114,7 @@ func (tx *Transaction) reserve(table, key string) error {
 	}
 	return nil
 }
-func (d *DB) Delete(id, table string, value datum.Value) error {
+func (d *DB) Delete(id, table string, value datum.Value, temporary bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
@@ -118,6 +126,9 @@ func (d *DB) Delete(id, table string, value datum.Value) error {
 	}
 	if tx.ReadOnly {
 		return fault("conflict", "read-only transaction")
+	}
+	if temporary {
+		return d.deleteTemporary(tx, table, value)
 	}
 	r, err := d.catalog.Relation(table)
 	if err != nil {
@@ -146,9 +157,11 @@ func (d *DB) Rollback(id string) error {
 	if err := d.usable(); err != nil {
 		return err
 	}
-	if _, err := d.tx(id); err != nil {
+	tx, err := d.tx(id)
+	if err != nil {
 		return err
 	}
+	d.releaseTemporary(tx)
 	delete(d.transactions, id)
 	return nil
 }
@@ -162,7 +175,12 @@ func (d *DB) Commit(id string) (Commit, error) {
 	if err != nil {
 		return Commit{}, err
 	}
-	defer delete(d.transactions, id)
+	// The transaction closes on every commit outcome, so its private relations
+	// are released here and never enter the journal with the durable writes.
+	defer func() {
+		d.releaseTemporary(tx)
+		delete(d.transactions, id)
+	}()
 	writes := make([]versions.Mutation, 0)
 	for table, mutations := range tx.writes {
 		for key, m := range mutations {
@@ -178,7 +196,7 @@ func (d *DB) Commit(id string) (Commit, error) {
 		}
 	}
 	if len(writes) == 0 {
-		return Commit{Sequence: tx.Snapshot}, nil
+		return Commit{Sequence: tx.Snapshot, TemporaryReleased: len(tx.temporary)}, nil
 	}
 	sort.Slice(writes, func(i, j int) bool {
 		if writes[i].Relation == writes[j].Relation {
@@ -190,5 +208,5 @@ func (d *DB) Commit(id string) (Commit, error) {
 		return Commit{}, err
 	}
 	d.commits++
-	return Commit{Sequence: d.sequence, Writes: len(writes)}, nil
+	return Commit{Sequence: d.sequence, Writes: len(writes), TemporaryReleased: len(tx.temporary)}, nil
 }

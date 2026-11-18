@@ -25,6 +25,17 @@ type Request struct {
 	Transaction string      `json:"transaction,omitempty"`
 	Aggregate   *Aggregate  `json:"aggregate,omitempty"`
 	ForceScan   bool        `json:"force_scan,omitempty"`
+	Temporary   bool        `json:"temporary,omitempty"`
+	Join        *Join       `json:"join,omitempty"`
+}
+
+// Join combines a transaction-private relation with one persistent relation.
+// The private column is matched against the persistent primary key at the
+// transaction's snapshot; the persistent row is only read, never written.
+type Join struct {
+	Relation string   `json:"relation"`
+	Column   string   `json:"column"`
+	Columns  []string `json:"columns"`
 }
 type Plan struct {
 	Access     string `json:"access"`
@@ -32,6 +43,9 @@ type Plan struct {
 	Candidates int    `json:"candidates"`
 	Snapshot   uint64 `json:"snapshot"`
 	Residuals  int    `json:"residuals"`
+	Temporary  bool   `json:"temporary,omitempty"`
+	Join       string `json:"join,omitempty"`
+	Joined     int    `json:"joined,omitempty"`
 }
 type Result struct {
 	Rows      []datum.Row `json:"rows"`

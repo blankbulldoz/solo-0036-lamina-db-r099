@@ -368,6 +368,29 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "temporary-relations",
+      "name": "transaction-private relations and combined reads",
+      "entry": "POST /transactions/{tx}/temporary; POST /query with temporary and join",
+      "steps": [
+        "transport",
+        "engine",
+        "catalog",
+        "query",
+        "versions"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "catalog",
+        "query",
+        "versions",
+        "datum"
+      ],
+      "success": "transaction-private relations and combined reads produces a verified domain result",
+      "failure": "temporary names do not shadow persistent relations; rows never enter the journal, backup or restart state",
+      "verification": "python3 examples/walkthrough.py --workflow temporary-relations"
     }
   ],
   "complexity": {

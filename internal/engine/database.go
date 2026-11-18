@@ -26,6 +26,12 @@ type DB struct {
 	commits      uint64
 	conflicts    uint64
 	queries      uint64
+
+	// Live temporary footprint, maintained on every private mutation so the
+	// capacity checks do not have to walk every active transaction.
+	temporaryRelations int
+	temporaryRows      int
+	temporaryBytes     int
 }
 
 func Open(dir string) (*DB, error) {
@@ -94,6 +100,9 @@ func (d *DB) Close() error {
 	}
 	d.closed = true
 	d.transactions = map[string]*Transaction{}
+	d.temporaryRelations = 0
+	d.temporaryRows = 0
+	d.temporaryBytes = 0
 	return d.wal.Close()
 }
 func (d *DB) publish(r journal.Record) error {

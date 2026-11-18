@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','temporary-relations']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -35,6 +35,8 @@ class Session:
   return body if raw else json.loads(body)
  def begin(self,readonly=False):return self.call('POST','/transactions',{'read_only':readonly},201)['id']
  def put(self,tx,row,status=200,insert=False):return self.call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':row,'insert_only':insert},status)
+ def put_temp(self,tx,relation,row,status=200):return self.call('POST',f'/transactions/{tx}/put',{'relation':relation,'row':row,'temporary':True},status)
+ def query_temp(self,tx,relation,**kwargs):return self.call('POST','/query',{'relation':relation,'temporary':True,'transaction':tx,**kwargs})
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
@@ -152,6 +154,49 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='temporary-relations':
+    schema={'primary':'sample','columns':[{'name':'sample','type':'int'},{'name':'amplitude','type':'int'}]}
+    owner=s.begin();peer=s.begin()
+    for tx,value in ((owner,500),(peer,600)):
+     s.call('POST',f'/transactions/{tx}/temporary',{'name':'spectra',**schema},201)
+     s.put_temp(tx,'spectra',{'sample':5,'amplitude':value})
+    own=s.query_temp(owner,'spectra');peer_rows=s.query_temp(peer,'spectra')
+    require(own['rows']==[{'sample':5,'amplitude':500}] and peer_rows['rows']==[{'sample':5,'amplitude':600}],'temporary names leaked across transactions')
+    require(s.query(where=[{'column':'sample','op':'=','value':5}])['rows'][0]['amplitude']==50,'temporary row entered persistent relation')
+    joined=s.query_temp(owner,'spectra',join={'relation':'spectra','column':'sample','columns':['band']})
+    require(joined['rows']==[{'sample':5,'amplitude':500,'band':'b5'}] and joined['plan']['join']=='spectra','temporary and persistent combination failed')
+    s.put(owner,tuple_(5,amplitude=55))
+    require(s.query(transaction=owner,where=[{'column':'sample','op':'=','value':5}])['rows'][0]['amplitude']==55,'persistent write shadowed by temporary name')
+    require(s.call('GET','/stats')['temporary']=={'relations':2,'rows':2,'bytes':64},'temporary footprint not reported')
+    s.call('POST',f'/transactions/{peer}/temporary/spectra/drop')
+    s.call('POST','/query',{'relation':'spectra','temporary':True,'transaction':peer},404)
+    require(s.query_temp(owner,'spectra')['rows'][0]['amplitude']==500,'one transaction drop affected another')
+    at=s.stats()['sequence'];out=s.commit(owner)
+    require(out['writes']==1 and out['temporary_released']==1,'commit did not separate temporary and persistent writes')
+    after=s.stats()
+    require(after['sequence']==at+1 and after['temporary']=={'relations':0,'rows':0,'bytes':0},'temporary data changed commit sequence or footprint')
+    require(next(r for r in s.query()['rows'] if r['sample']==5)['amplitude']==55,'persistent commit lost with temporary release')
+    changes=s.call('GET',f'/changes?after={at}')['records']
+    require(all(r['kind']!='relation' for r in changes) and sum(len(r.get('writes',[])) for r in changes)==1,'temporary relation reached the journal')
+    limited=s.begin();used=0
+    while True:
+     try:s.call('POST',f'/transactions/{limited}/temporary',{'name':f'scratch{used}','primary':'k','columns':[{'name':'k','type':'int'}]},201);used+=1
+     except RuntimeError as e:require('429' in str(e),'capacity limit had wrong status');break
+    require(used==8,'temporary relation per-transaction limit changed')
+    filled=s.begin()
+    s.call('POST',f'/transactions/{filled}/temporary',{'name':'rows','primary':'k','columns':[{'name':'k','type':'int'}]},201)
+    for k in range(1000):s.put_temp(filled,'rows',{'k':k})
+    s.put_temp(filled,'rows',{'k':1000},429)
+    s.call('POST','/query',{'relation':'rows','temporary':True,'transaction':filled,'at':1},400)
+    s.call('POST',f'/transactions/{filled}/rollback')
+    require(s.stats()['temporary']['rows']==0 and s.stats()['temporary']['bytes']==0,'rollback retained temporary footprint')
+    s.call('POST',f'/transactions/{peer}/rollback')
+    s.call('POST',f'/transactions/{limited}/rollback')
+    require(s.stats()['temporary']=={'relations':0,'rows':0,'bytes':0},'closed transactions retained temporary footprint')
+    s.call('POST','/checkpoint');s.stop();s.start()
+    require(s.query()['matched']==7 and s.stats()['temporary']=={'relations':0,'rows':0,'bytes':0},'restart resurrected temporary data')
+    require([r['name'] for r in s.call('GET','/catalog')['relations']]==['spectra'],'temporary relation entered the persistent catalog')
+    observations={'private':own['rows'],'peer':peer_rows['rows'],'joined':joined['rows'],'commit':out,'limits':{'relations':used,'rows':1000},'released':after['temporary']}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

@@ -19,7 +19,7 @@ go build -o bin/laminad ./cmd/laminad
 python3 examples/walkthrough.py --workflow all
 ```
 
-该命令启动临时实例，执行 14 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
+该命令启动临时实例，执行 15 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
 
 ## 一个事务
 
@@ -53,6 +53,22 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 数据库提供快照隔离和同键 first-committer-wins，不承诺串行化、谓词锁或跨行写偏差防护。提交前对最终可见状态检查所有受影响关系的唯一索引；一次事务内可以置换唯一值。失败提交会关闭该事务，不发布任何私有行。只读事务通过 `{"read_only":true}` 开始。
 
 SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integer_column)`，可选 WHERE AND、ORDER BY、LIMIT。字符串使用单引号，内部单引号写两次；关键字及未引号标识符转为小写。没有 JOIN、GROUP BY、别名、表达式、SQL DDL/DML。语义检查与结构化查询共用绑定和执行。`sum` 忽略 null，空输入返回 null，溢出报错；`count(column)` 忽略 null，`count(*)` 计算全部匹配行。
+
+## 事务私有临时关系
+
+分析和编辑过程中需要保存中间结果时，可以在事务内建立只属于该事务的关系。它不进入持久目录、版本链或日志，因此既不会被其他调用方看到，也不会进入变更流、检查点或备份。
+
+```sh
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/temporary -H 'Content-Type: application/json' -d '{"name":"staging","primary":"sample","columns":[{"name":"sample","type":"int"},{"name":"amplitude","type":"int"}]}'
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/put -H 'Content-Type: application/json' -d '{"relation":"staging","temporary":true,"row":{"sample":1,"amplitude":40}}'
+curl -s http://127.0.0.1:7386/v1/lamina/query -H 'Content-Type: application/json' -d '{"relation":"staging","temporary":true,"transaction":"<id>","join":{"relation":"spectra","column":"sample","columns":["band"]}}'
+```
+
+`POST /transactions/{id}/temporary` 创建，`GET` 列出本次事务的关系与占用，`POST /transactions/{id}/temporary/{name}/drop` 立即释放。`put`、`delete`、`/query`、`/get` 和 `/sql` 都接受 `temporary:true`。临时名称在所属事务的私有命名空间内解析，因此可以与持久关系或其他事务的临时关系同名而不会互相遮蔽；写入 `spectra` 而不带 `temporary` 始终作用于持久关系。`/query` 的 `join` 读取事务快照中的持久行，只把临时行与持久行组合到结果，不写回任一对象。
+
+临时关系只在所属事务活跃期间存在。提交只发布持久写集，同时释放全部临时关系；撤销、冲突或其他导致闭合的提交失败同样立即丢弃它们；只读事务不能创建或写入临时关系。已返回的查询结果是副本，可在释放后继续使用；但数据库不会让其他事务的读取依赖临时对象，因此无需额外水位保护。重启、恢复或从备份还原后不存在任何临时关系。
+
+容量按事务 8 个关系、1000 行、4MiB，全库 128 个关系、32768 行、32MiB 拒绝，返回 429 且不部分写入；替换已有主键不计新增行。`GET /stats` 的 `temporary` 字段报告全库占用，活跃事务条目带 `temporary_relations` 计数。临时数据不是持久化或备份承诺的一部分，也不能改名为持久关系后继续使用；需要持久结果时请显式写入普通关系并提交。
 
 ## 索引
 
@@ -89,7 +105,7 @@ curl -s http://127.0.0.1:7386/v1/lamina/backup -o /tmp/lamina-backup.lmi
 
 ## 资源与错误
 
-请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
+请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。事务私有临时关系另有每事务 8 个关系、1000 行、4MiB 与全库 128 个关系、32768 行、32MiB 的上限。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
 
 错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突或唯一冲突 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
 
